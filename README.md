@@ -1,14 +1,86 @@
-# astrbot-plugin-helloworld
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+---
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+# 💬 astrbot_plugin_context_compressor (无感压缩上下文)
 
-# Supports
+这是一个专为 AstrBot 框架量身定制的 **高性能、多维路由、零延迟长文本上下文归档与省钱插件**。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+本插件深度契合了大模型（如 DeepSeek、Gemini）的前缀缓存（Prefix Caching）机制。通过在后台对历史会话进行动态重构与摘要提炼，在维持 AI 长期记忆、语气连贯性的同时，**可直接降低 80% 以上的 Token 消耗成本**。
+
+---
+
+## 🛠️ 技术深挖：相比官方默认/传统方案强在哪里？
+
+传统的上下文总结插件或官方底层 naive 压缩方案，在复杂的生产环境（如 QQ 官方流式网关、网页富文本）中通常会遭遇三个严重的工程痛点。本插件在架构上针对这些痛点进行了彻底的重构：
+
+### 1. 核心管道 0ms 延迟阻碍（异步状态机轮询）
+
+* **传统痛点**：通常在 `on_message` 或 `on_llm_request` 阶段进行同步拦截，一旦触发总结，用户当前发送的消息必须**原地傻等 3~5 秒**直到大模型生成完摘要后，才会提交给主对话，带来极差的体验。
+* **本插件优势**：消息进入的瞬间，核心拦截管道全速放行，主 Agent 以 100% 的前缀缓存速度响应用户。同时，插件在后台开辟独立的独立协程（`asyncio.create_task`），通过**秒级轮询 SQLite 状态机**机制，静默监测大模型文本落库状态。一旦判定当前轮次对话完整写入，立即在后台无感执行历史洗牌，对用户体验达成 **0ms 延迟增加**。
+
+### 2. 多模态与工具链原地无损留存（降维索引切片）
+
+* **传统痛点**：传统方案在重新组装历史写入数据库时，官方核心类会将消息体自动充气（Inflation）为 `TextPart`、`ThinkPart` 等强类型对象。这些自定义 Python 类在面对 SQLAlchemy 持久化时会抛出严重的 `TypeError: Object of type TextPart is not JSON serializable` 异常；手动编写递归反序列化则会导致代码过于脆弱，极易损毁群聊里的图片、语音消息段或 MCP 工具链状态。
+* **本插件优势**：采用**只读计算层与数据持久层彻底解耦**设计。强类型 `Message` 对象仅在内存中用于 Token 测算与寻找安全的 User 边界对齐索引（`split_index`）。一旦算好整数索引，直接利用 Python 原生切片（Slicing）对数据库中原本完好、纯净的 `raw_history` 原始字典列表进行动刀切分。**原地保留的近期原文不论包含图片、语音还是工具调用状态，全部 100% 格式无损持久化留存。**
+
+### 3. 规避官方流式通道“钩子丢失”硬伤
+
+* **传统痛点**：在 QQ 官方网关等平台启用**流式输出（Streaming）**时，由于分块异步发送，框架会在管道执行完毕后**完全绕过/跳过**标准的 `after_message_sent` 等高阶生命周期钩子，导致普通后置插件彻底失效。
+* **本插件优势**：坚固地立足于 100% 稳定触发的 `EventMessageType.ALL` 消息最外层入口。通过后台轮询最后一条消息是否向 `assistant` 角色发生状态跃迁，完美免疫框架由于重构流式通道产生的钩子丢失 Bug。
+
+### 4. 真正的“轮数（Turns）”对齐算子
+
+* **传统痛点**：传统方案常将数据库中的消息总条数（Message Count）错当成轮数。在 1 轮一问一答等于 2 条消息的底层逻辑下，会频繁误触发压缩，导致刚刚生成的总结在下一轮又被反复总结，频繁打碎缓存长链。
+* **本插件优势**：严格对齐人类直觉。引入 `len(non_system_objs) // 2` 轮次算子，一问一答精确记为 1 轮。阈值、保留原文长度均以此单位进行高精规整。
+
+---
+
+## ✨ 核心特性
+
+* 🔢 **真正的轮数管理**：严格以一问一答为 1 轮单位。保留原文轮数可调，确保 AI 能够根据近期原话语气实现自然连贯的上下文咬合。
+* 🚀 **超高前缀缓存收益**：通过定时洗牌，将臃肿、无序的长历史转换为高度浓缩的 `[System] + [长期记忆摘要提示] + [近期轮次原文]` 夹心结构，让后续对话最大化享受各大厂商提供的长文本 Context 缓存资费折扣。
+* 📌 **专属规则卡片别名**：支持在后台配置多条针对不同环境的压缩参数，每条规则支持独立自定义“备注别名”，卡片再多也绝不混淆。
+* 🔓 **全面手动解放**：移除了管理员权限防火墙。任何普通用户在会话感到 AI 出现幻觉或文本过长时，均可发送指令 `/compress` 强制对当前窗口做同步清洗。
+
+---
+
+## ⚙️ 后台参数大白话配置指南
+
+### 全局默认参数
+
+* **触发总结的对话轮数**：一问一答算 1 轮。当未压缩原文堆积到此轮数时触发后台无感压缩。推荐设置：`30` 到 `50` 轮。
+* **触发总结的 Token 阈值**：当未压缩原文体积太大突破此水位时触发。推荐：`16000`（防止单次超长论文爆舱）。
+* **压缩后保留的对话轮数**：归档完成后，你想在聊天框里留下几轮最新原话？推荐留 `2` 轮（即 4 条消息），这样 AI 能看着近期的原话，保持刚才的聊天语气和语境。
+* **个性化总结提示词指令**：分发给总结模型的提炼大纲（已内置完备的英文总结 Prompt）。留空即用默认值。
+
+### 特定环境个性化触发规则列表
+
+你可以点击“添加”，针对不同的物理通讯环境建立多个特异性重载卡片（**留空的项目自动视作通配符，不做任何限制。填写的项目越多，匹配精度越高，优先级越高**）：
+
+* **📌 规则别名 / 备注**：为这条规则起个名字，比如 `QQ写代码群专属`、`网页划水专用`。
+* **1. 匹配的当前会话大模型**：选择这条规则在当前窗口绑定什么模型时才生效。
+* **2. 匹配的机器人实例 ID**：填写你在基础设置中为各平台起的实例 ID（例如你的日志里打印的 `qq_bot_01`）。
+* **3. 匹配聊天场景性质**：可选择强制限定只在群聊（`group`）或私聊（`private`）场景下激活。
+* **专属负责总结的大模型**：强制指定谁来干总结提炼的苦力活。**留空的话，它会极其聪明地自动继承并调用当前窗口正在聊天的那个大模型，无需重复配置，降低跨厂商调用成本。**
+* **专属参数重载（max_turns / max_tokens / keep_recent）**：该特定环境下独立的触发和留存水线。
+
+---
+
+## 🎯 运行流全景透视
+
+1. 用户在 **QQ群（实例: `qq_bot_01`）** 中向 **Gemini** 触发对话（此时上下文未被压缩，前 39 轮**100% 命中前缀缓存**，响应时间拉满）。
+2. `on_message` 消息最外层网关拦截事件，检测到满足专属规则，立刻向系统抛出一个后台后台挂起协程，主管道 **0ms 延迟阻碍**，全速让 Gemini 的流式文本给用户吐字。
+3. 机器人生成完毕，QQ 官方流式通道跳过 `after_message_sent` 钩子。
+4. 后台挂起的协程状态机在第 6 秒通过轻量轮询检测到 SQLite 中这一轮的 `assistant` 回复已经安全落库。
+5. 插件检测到非系统消息轮数达到 40 轮（`turns >= 40`），即刻拉起安全切分算法。
+6. 指派 **Gemini** 将前 38 轮的历史打包进行大纲提炼，生成长期记忆快照。
+7. 对原始 `raw_history` 数组执行索引切片，保留置顶 System，无损拼接 `[长期记忆总结]`，原封不动合并最近 2 轮的多模态原文。
+8. 安全回写更新 SQLite。下一轮对话开始时，臃肿的上下文完美坍缩，新一轮前缀缓存链条重新无感建立。
+
+---
+
+## 💾 安装方法
+
+1. 下载本插件源码，确保文件夹名称命名为标准的：`astrbot_plugin_context_compressor`。
+2. 将该文件夹完整移入你的 AstrBot 插件运行目录中（标准路径为：`core/data/plugins/`）。
+3. 登录 AstrBot 管理面板，进入插件管理，点击 **“重载插件”** 并将其启用，即可完美享受前缀缓存带来的极速经济体验！

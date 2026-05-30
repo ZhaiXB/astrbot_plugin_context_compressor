@@ -1,0 +1,74 @@
+{
+    "max_conversation_length": {
+        "description": "触发总结的对话轮数",
+        "type": "int",
+        "default": 40,
+        "hint": "一问一答算1轮。当会话中未压缩的原文达到此轮数时，后台自动触发无感总结。默认值：40"
+    },
+    "max_context_tokens": {
+        "description": "触发总结的 Token 阈值",
+        "type": "int",
+        "default": 16000,
+        "hint": "当未压缩原文的估算 Token 达到此数值时触发总结。0 表示不限制。默认值：16000"
+    },
+    "keep_recent": {
+        "description": "压缩后保留的对话轮数",
+        "type": "int",
+        "default": 2,
+        "hint": "总结完成后，原地保留几轮最新的对话原文（不被压缩），用于维持当前的聊天语气。默认值：2"
+    },
+    "summary_instruction": {
+        "description": "个性化总结提示词指令",
+        "type": "text",
+        "default": "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n1. Systematically cover all core topics discussed and the final conclusion/outcome for each; clearly highlight the latest primary focus.\n2. If any tools were used, summarize tool usage (total call count) and extract the most valuable insights from tool outputs.\n3. If there was an initial user goal, state it first and describe the current progress/status.\n4. Write the summary in the user's language.\n",
+        "hint": "分发给大模型的总结大纲要求。留空则自动使用内置的系统默认英文指令。"
+    },
+    "special_rules": {
+        "type": "template_list",
+        "description": "特定环境个性化触发规则",
+        "hint": "允许你针对特定大模型、机器人实例或群聊/私聊独立定制水线。单项留空代表不作限制（通配）。填写的约束项越多，匹配优先级越高。",
+        "templates": {
+            "combined_rule": {
+                "name": "添加专属触发规则",
+                "items": {
+                    "rule_name": {
+                        "description": "📌 规则别名 / 备注",
+                        "type": "string",
+                        "default": "新规则",
+                        "hint": "为这条专属规则起个名字，方便多条规则时一眼区分。例如：QQ代码群专属 / Web端测试"
+                    },
+                    "target_provider": { 
+                        "description": "1. 匹配的当前会话大模型", 
+                        "type": "string", 
+                        "default": "",
+                        "hint": "选择该规则生效的目标对话模型，留空表示不限制模型。",
+                        "_special": "select_provider"
+                    },
+                    "target_platform_id": {
+                        "description": "2. 匹配的机器人实例 ID",
+                        "type": "string",
+                        "default": "",
+                        "hint": "填写你在后台为各平台配置的实例 ID（例如：qq_bot_01），留空表示不限制平台。"
+                    },
+                    "chat_type": {
+                        "description": "3. 匹配聊天场景性质",
+                        "type": "string",
+                        "default": "",
+                        "options": ["", "group", "private"],
+                        "hint": "可强制限定在群聊(group)或私聊(private)场景下生效。留空不限。"
+                    },
+                    "rule_summary_provider": {
+                        "description": "专属负责总结的大模型",
+                        "type": "string",
+                        "default": "",
+                        "hint": "强制指定执行历史压缩任务的模型。留空则默认直接继承当前会话正在使用的对话模型。",
+                        "_special": "select_provider"
+                    },
+                    "max_turns": { "description": "专属对话轮数阈值", "type": "int", "default": 40, "hint": "此特定环境下触发自动压缩的轮数。默认值：40" },
+                    "max_tokens": { "description": "专属 Token 阈值", "type": "int", "default": 16000, "hint": "此特定环境下触发自动压缩的 Token数。默认值：16000" },
+                    "keep_recent": { "description": "专属保留对话轮数", "type": "int", "default": 2, "hint": "此特定环境下压缩后保留的最新原文轮数。默认值：2" }
+                }
+            }
+        }
+    }
+}
