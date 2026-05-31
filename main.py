@@ -12,7 +12,7 @@ try:
     HAS_OFFICIAL_CHECKPOINT_OPERATORS = True
 except ImportError:
     HAS_OFFICIAL_CHECKPOINT_OPERATORS = False
-    logger.warning("[无感压缩上下文] ⚠️ 无法导入官方核心强类型 Checkpoint 算子，自动降级为基础纯字典对象流兼容层！")
+    logger.warning("[无感压缩] ⚠️ 无法导入官方 Checkpoint 算子，已自动降级为纯字典兼容层！")
 
     class Message:
         def __init__(self, role: str, content: Any = None, **kwargs):
@@ -53,7 +53,7 @@ except ImportError:
 try:
     from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 except ImportError:
-    logger.warning("[无感压缩上下文] ⚠️ 无法导入官方核心 EstimatorTokenCounter 算子，将自动降级为字数估算兜底兼容层！")
+    logger.warning("[无感压缩] ⚠️ 无法导入官方 EstimatorTokenCounter 算子，已自动降级为字数估算兼容层！")
     class EstimateTokenCounter:
         def count_tokens(self, messages: list) -> int:
             total = 0
@@ -95,7 +95,7 @@ class CanonicalCompressorPlugin(Star):
         self.compressing_cids = set()  # 记录正在后台执行总结压缩的 CID 集合
         self.polling_cids = set()  # 记录正在进行后台等待的 CID 集合，彻底消灭冗余轮询协程
 
-        logger.info("[无感压缩上下文] v2.2.6 极致通用·纯净对象流闭换交付版载入成功。")
+        logger.info("[无感压缩] v2.2.6 极致通用对象流版载入成功。")
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any):
@@ -212,7 +212,7 @@ class CanonicalCompressorPlugin(Star):
                 await self._run_canonical_compression(event, force_trigger=False)
             except Exception as run_err:
                 logger.error(
-                    f"[无感压缩上下文] 后台自适应压缩发生异常: {run_err}", exc_info=True
+                    f"[无感压缩] 后台自适应压缩发生异常: {run_err}", exc_info=True
                 )
         finally:
             # 无论等待完成还是抛出异常，在析构时无条件释放会话的 Polling 锁
@@ -263,7 +263,7 @@ class CanonicalCompressorPlugin(Star):
         # 核心防患未然：如果当前会话已经在执行后台压缩，后续的重叠重试协程直接就地安全退避
         if curr_cid in self.compressing_cids:
             logger.debug(
-                f"[无感压缩上下文] 会话 {curr_cid} 正在后台压缩中，跳过本次重叠触发。"
+                f"[无感压缩] 会话 {curr_cid[-8:] if curr_cid else 'N/A'} 正在后台压缩中，跳过本次重叠触发。"
             )
             return False
 
@@ -278,7 +278,7 @@ class CanonicalCompressorPlugin(Star):
             try:
                 raw_history = json.loads(conversation.history)
             except Exception as e:
-                logger.error(f"[无感压缩上下文] 解析会话历史记录 JSON 失败: {e}")
+                logger.error(f"[无感压缩] 解析会话历史记录 JSON 失败: {e}")
                 return False
 
             # 1. 照搬官方：利用强类型装配算子将生历史一键转换为 Message 对象数组
@@ -353,9 +353,15 @@ class CanonicalCompressorPlugin(Star):
             # 极端边界防御：清洗 keep_recent 配置，保证其至少为 1
             keep_recent = max(1, keep_recent)
 
-            # 2. 精准审计轮数：直接通过强类型 Message 对象计算 User 出现的绝对次数
+            # 2. 精准审计与 Token 统计：通过 Message 对象统计用户轮数与估算 Token
             user_indices = [i for i, m in enumerate(dialogue_messages) if m.role == "user"]
             current_turns = len(user_indices)
+            current_tokens = self.token_counter.count_tokens(dialogue_messages)
+
+            logger.info(
+                f"[无感压缩] 会话 {curr_cid[-8:] if curr_cid else 'N/A'}: "
+                f"当前 {current_turns} 轮/{current_tokens}T (阈值: {max_turns}轮/{max_tokens}T)"
+            )
 
             # 极端边界防御：如果我们保留的最近轮数 >= 总用户轮数，说明没有老对话可压缩，直接就地返回 False
             if len(user_indices) <= keep_recent:
@@ -371,7 +377,7 @@ class CanonicalCompressorPlugin(Star):
                     should_compress = True
                 elif (
                     max_tokens > 0
-                    and self.token_counter.count_tokens(dialogue_messages) >= max_tokens
+                    and current_tokens >= max_tokens
                 ):
                     should_compress = True
 
@@ -405,14 +411,20 @@ class CanonicalCompressorPlugin(Star):
             base_kwargs = self.kwargs_snapshot.get(curr_cid) or {}
 
             if not base_system_prompt:
+                logger.warning(f"[无感压缩] 会话 {curr_cid[-8:] if curr_cid else 'N/A'} 未截获 System Prompt 快照，使用兜底提示词(缓存命中率可能受影响)。")
                 base_system_prompt = "You are a helpful and precise AI partner."
 
             # 5. 原汁原味对象投递
             summary_instruction = self.config.get(
                 "summary_instruction", ""
             ).strip() or (
-                "Based on our full conversation history, produce a concise summary of key takeaways.\n"
-                "Write the summary in the user's language."
+                "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n"
+                "The primary goal of this summary is to enable seamless continuation of the work that follows.\n"
+                "1. Systematically cover all core topics discussed and the final conclusion/outcome for each; clearly highlight the latest primary focus.\n"
+                "2. If any tools were used, summarize tool usage (total call count) and extract the most valuable insights from tool outputs.\n"
+                "3. If any materials (files, documents, code, references) were read during the conversation that may be helpful for subsequent work, list each one with its scope and path.\n"
+                "4. If there was an initial user goal, state it first and describe the current progress/status.\n"
+                "5. Write the summary in the user's language."
             )
 
             payload_contexts = to_summarize_messages + [
@@ -446,10 +458,10 @@ class CanonicalCompressorPlugin(Star):
                         delta_messages = latest_messages[len(all_messages) :]
                         recent_messages = recent_messages + delta_messages
                         logger.info(
-                            f"[无感压缩上下文] ⚡ 检测到总结的 3 秒内发生高频手快新消息！已就地追加 {len(delta_messages)} 条增量补丁，无损合流。"
+                            f"[无感压缩] ⚡ 检测到 3 秒内发生高频新消息！已追加 {len(delta_messages)} 条增量补丁，无损合流。"
                         )
                 except Exception as ex:
-                    logger.warning(f"[无感压缩上下文] 提取增量历史补丁时退避: {ex}")
+                    logger.warning(f"[无感压缩] 提取增量补丁退避: {ex}")
 
             # 6. 原生对象级落库组装
             system_messages = [m for m in all_messages if m.role == "system"]
@@ -479,9 +491,7 @@ class CanonicalCompressorPlugin(Star):
                 except Exception as db_err:
                     if "locked" in str(db_err).lower() and attempt < 4:
                         sleep_time = 0.2 * (2**attempt)
-                        logger.warning(
-                            f"[无感压缩上下文] 遇到数据库锁冲突，正在执行第 {attempt + 1} 次指数退避 ({sleep_time}s)..."
-                        )
+                        logger.warning(f"[无感压缩] 数据库锁冲突，执行第 {attempt + 1} 次指数退避 ({sleep_time}s)...")
                         await asyncio.sleep(sleep_time)
                     else:
                         raise db_err
