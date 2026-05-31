@@ -75,7 +75,7 @@ from typing import Any
 
 
 @register(
-    "astrbot_plugin_context_compressor", "kitakita0421", "无感压缩上下文", "2.2.6"
+    "astrbot_plugin_context_compressor", "kitakita0421", "无感压缩上下文", "2.3.0"
 )
 class CanonicalCompressorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -95,7 +95,7 @@ class CanonicalCompressorPlugin(Star):
         self.compressing_cids = set()  # 记录正在后台执行总结压缩的 CID 集合
         self.polling_cids = set()  # 记录正在进行后台等待的 CID 集合，彻底消灭冗余轮询协程
 
-        logger.info("[无感压缩] v2.2.6 极致通用对象流版载入成功。")
+        logger.info("[无感压缩] v2.3.0 极致通用对象流版载入成功。")
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any):

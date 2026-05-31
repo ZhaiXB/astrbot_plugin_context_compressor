@@ -1,6 +1,6 @@
 name: astrbot_plugin_context_compressor
 display_name: 无感压缩上下文
 desc: 高性能、多维路由、零延迟长文本上下文归档与省token插件。
-version: v2.2.6
+version: v2.3.0
 author: kitakita0421
 repo: https://github.com/ZhaiXB/astrbot_plugin_context_compressor
