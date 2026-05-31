@@ -2,13 +2,73 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 
-# 完美引入官方核心强类型骨架 with 序列化/反序列化无损算子
-from astrbot.core.agent.message import (
-    Message,
-    bind_checkpoint_messages,
-    dump_messages_with_checkpoints,
-)
-from astrbot.core.agent.context.token_counter import EstimateTokenCounter
+# 完美引入官方核心强类型骨架 with 序列化/反序列化无损算子 (带防断裂降级保护)
+try:
+    from astrbot.core.agent.message import (
+        Message,
+        bind_checkpoint_messages,
+        dump_messages_with_checkpoints,
+    )
+    HAS_OFFICIAL_CHECKPOINT_OPERATORS = True
+except ImportError:
+    HAS_OFFICIAL_CHECKPOINT_OPERATORS = False
+    logger.warning("[无感压缩上下文] ⚠️ 无法导入官方核心强类型 Checkpoint 算子，自动降级为基础纯字典对象流兼容层！")
+
+    class Message:
+        def __init__(self, role: str, content: Any = None, **kwargs):
+            self.role = role
+            self.content = content
+            self._checkpoint_after = None
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+        
+        def model_dump(self):
+            res = {"role": self.role, "content": self.content}
+            for k, v in self.__dict__.items():
+                if not k.startswith("_") and k not in res:
+                    res[k] = v
+            return res
+
+    def bind_checkpoint_messages(history: list[dict]) -> list[Message]:
+        messages = []
+        for item in history:
+            if item.get("role") == "_checkpoint":
+                if messages:
+                    messages[-1]._checkpoint_after = item.get("content")
+                continue
+            messages.append(Message(**item))
+        return messages
+
+    def dump_messages_with_checkpoints(messages: list[Message]) -> list[dict]:
+        dumped = []
+        for m in messages:
+            dumped.append(m.model_dump())
+            if getattr(m, "_checkpoint_after", None) is not None:
+                dumped.append({
+                    "role": "_checkpoint",
+                    "content": m._checkpoint_after
+                })
+        return dumped
+
+try:
+    from astrbot.core.agent.context.token_counter import EstimateTokenCounter
+except ImportError:
+    logger.warning("[无感压缩上下文] ⚠️ 无法导入官方核心 EstimatorTokenCounter 算子，将自动降级为字数估算兜底兼容层！")
+    class EstimateTokenCounter:
+        def count_tokens(self, messages: list) -> int:
+            total = 0
+            for m in messages:
+                content = getattr(m, "content", "")
+                if isinstance(content, str):
+                    total += len(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            total += len(part.get("text", ""))
+                        elif hasattr(part, "text"):
+                            total += len(part.text)
+            return total // 2
+
 import json
 import asyncio
 from typing import Any
@@ -33,6 +93,7 @@ class CanonicalCompressorPlugin(Star):
 
         # 核心防患未然：异步并发重叠防重锁（确保同一会话同一时间只有一个总结任务在飞）
         self.compressing_cids = set()  # 记录正在后台执行总结压缩的 CID 集合
+        self.polling_cids = set()  # 记录正在进行后台等待的 CID 集合，彻底消灭冗余轮询协程
 
         logger.info("[无感压缩上下文] v2.2.6 极致通用·纯净对象流闭换交付版载入成功。")
 
@@ -49,7 +110,7 @@ class CanonicalCompressorPlugin(Star):
                 if getattr(req, "func_tool", None):
                     self.tools_snapshot[curr_cid] = req.func_tool
 
-                # 动态全量超参数搜刮（不改变、不碰消息体，只剥离数值/控制参数）
+                # 动态全量超参数搜刮（只搜刮控制型超参数，必须把所有非JSON序列化对象及模型名彻底黑名单过滤）
                 extracted_kwargs = {}
                 standard_fields = {
                     "prompt",
@@ -58,6 +119,11 @@ class CanonicalCompressorPlugin(Star):
                     "func_tool",
                     "image_urls",
                     "audio_urls",
+                    "session_id",
+                    "conversation",  # 必须排除数据库实体模型，避免触发 sql 序列化崩溃
+                    "tool_calls_result",  # 必须排除工具调用复杂模型
+                    "extra_user_content_parts",  # 必须排除多模态缓存复杂类
+                    "model",  # 必须排除 model 属性，保证压缩任务路由的独立性不受原始请求偏置干扰
                 }
                 for k, v in getattr(req, "__dict__", {}).items():
                     if (
@@ -97,46 +163,60 @@ class CanonicalCompressorPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         """分派后台异步状态机轮询"""
-        asyncio.create_task(self._background_wait_and_compress(event))
-
-    async def _background_wait_and_compress(self, event: AstrMessageEvent):
-        """秒级轮询落库状态机"""
         conv_mgr = self.context.conversation_manager
         uid = event.unified_msg_origin
         curr_cid = await conv_mgr.get_curr_conversation_id(uid)
+        if not curr_cid:
+            return
 
-        initial_count = 0
-        conversation = await conv_mgr.get_conversation(uid, curr_cid)
-        if conversation and conversation.history:
-            try:
-                initial_count = len(json.loads(conversation.history))
-            except Exception:
-                pass
+        # 引入防重复轮询锁机制，每个 CID 在同一时刻有且仅有一个轮询器在跑，大幅节约空转开销
+        if curr_cid in self.polling_cids:
+            return
 
-        for i in range(25):
-            await asyncio.sleep(1.0)
-            conversation = await conv_mgr.get_conversation(uid, curr_cid)
-            if not conversation or not conversation.history:
-                continue
+        self.polling_cids.add(curr_cid)
+        asyncio.create_task(self._background_wait_and_compress(event, curr_cid))
 
-            try:
-                current_history = json.loads(conversation.history)
-                current_count = len(current_history)
-
-                if (
-                    current_count > initial_count
-                    and current_history[-1].get("role") == "assistant"
-                ):
-                    break
-            except Exception:
-                pass
-
+    async def _background_wait_and_compress(self, event: AstrMessageEvent, curr_cid: str):
+        """秒级轮询落库状态机"""
         try:
-            await self._run_canonical_compression(event, force_trigger=False)
-        except Exception as run_err:
-            logger.error(
-                f"[无感压缩上下文] 后台自适应压缩发生异常: {run_err}", exc_info=True
-            )
+            conv_mgr = self.context.conversation_manager
+            uid = event.unified_msg_origin
+
+            initial_count = 0
+            conversation = await conv_mgr.get_conversation(uid, curr_cid)
+            if conversation and conversation.history:
+                try:
+                    initial_count = len(json.loads(conversation.history))
+                except Exception:
+                    pass
+
+            for i in range(25):
+                await asyncio.sleep(1.0)
+                conversation = await conv_mgr.get_conversation(uid, curr_cid)
+                if not conversation or not conversation.history:
+                    continue
+
+                try:
+                    current_history = json.loads(conversation.history)
+                    current_count = len(current_history)
+
+                    if (
+                        current_count > initial_count
+                        and current_history[-1].get("role") == "assistant"
+                    ):
+                        break
+                except Exception:
+                    pass
+
+            try:
+                await self._run_canonical_compression(event, force_trigger=False)
+            except Exception as run_err:
+                logger.error(
+                    f"[无感压缩上下文] 后台自适应压缩发生异常: {run_err}", exc_info=True
+                )
+        finally:
+            # 无论等待完成还是抛出异常，在析构时无条件释放会话的 Polling 锁
+            self.polling_cids.discard(curr_cid)
 
     def _resolve_runtime_context(
         self, event: AstrMessageEvent, conversation
@@ -187,111 +267,118 @@ class CanonicalCompressorPlugin(Star):
             )
             return False
 
-        conversation = await conv_mgr.get_conversation(uid, curr_cid)
-        if not conversation or not conversation.history:
-            return False
-
-        try:
-            raw_history = json.loads(conversation.history)
-        except Exception as e:
-            logger.error(f"[无感压缩上下文] 解析会话历史记录 JSON 失败: {e}")
-            return False
-
-        # 1. 照搬官方：利用强类型装配算子将生历史一键转换为 Message 对象数组
-        all_messages = bind_checkpoint_messages(raw_history)
-        dialogue_messages = [m for m in all_messages if m.role != "system"]
-
-        # 提取当前特征
-        runtime_provider, _ = self._resolve_runtime_context(event, conversation)
-
-        # 格式化解耦判定：只要触发了内部抽象占位符，或者取出的模型格式不合法（缺少提供商前缀 /），一律强行向下刷新
-        if (
-            runtime_provider == self.default_provider_placeholder
-            or "/" not in runtime_provider
-        ):
-            runtime_provider = await self.context.get_current_chat_provider_id(umo=uid)
-
-        runtime_provider = str(runtime_provider).strip()
-        runtime_platform_id = event.get_platform_id()
-        runtime_group_id = (
-            str(event.message_obj.group_id).strip()
-            if (event.message_obj and event.message_obj.group_id)
-            else ""
-        )
-        runtime_chat_type = "group" if runtime_group_id else "private"
-
-        # 载入配置
-        try:
-            max_turns = int(self.config.get("max_conversation_length", 40))
-            max_tokens = int(self.config.get("max_context_tokens", 16000))
-            keep_recent = int(self.config.get("keep_recent", 2))
-        except (ValueError, TypeError):
-            max_turns, max_tokens, keep_recent = 40, 16000, 2
-
-        # 路由网格规则碰撞
-        special_rules = self.config.get("special_rules", [])
-        best_rule, best_specificity_score = None, -1
-        for rule in special_rules:
-            if (
-                rule.get("target_provider", "").strip()
-                and rule.get("target_provider", "").strip() != runtime_provider
-            ):
-                continue
-            if (
-                rule.get("target_platform_id", "").strip()
-                and rule.get("target_platform_id", "").strip() != runtime_platform_id
-            ):
-                continue
-            if (
-                rule.get("chat_type", "").strip()
-                and rule.get("chat_type", "").strip() != runtime_chat_type
-            ):
-                continue
-            current_score = sum(
-                [
-                    bool(rule.get("target_provider")),
-                    bool(rule.get("target_platform_id")),
-                    bool(rule.get("chat_type")),
-                ]
-            )
-            if current_score > best_specificity_score:
-                best_specificity_score = current_score
-                best_rule = rule
-
-        if best_rule and best_specificity_score > 0:
-            try:
-                max_turns = int(best_rule.get("max_turns", max_turns))
-                max_tokens = int(best_rule.get("max_tokens", max_tokens))
-                keep_recent = int(best_rule.get("keep_recent", keep_recent))
-            except (ValueError, TypeError):
-                pass
-
-        # 2. 精准审计轮数：直接通过强类型 Message 对象计算 User 出现的绝对次数
-        user_indices = [i for i, m in enumerate(dialogue_messages) if m.role == "user"]
-        current_turns = len(user_indices)
-
-        if len(dialogue_messages) <= keep_recent * 2 or current_turns < max_turns:
-            return False
-
-        # 阈值判定
-        should_compress = force_trigger
-        if not should_compress:
-            if current_turns >= max_turns:
-                should_compress = True
-            elif (
-                max_tokens > 0
-                and self.token_counter.count_tokens(dialogue_messages) >= max_tokens
-            ):
-                should_compress = True
-
-        if not should_compress:
-            return False
-
-        # 成功突破阈值关卡，正式对当前 CID 上内存会话锁
+        # 立即上锁，彻底消除 TOCTOU 并发竞态隐患
         self.compressing_cids.add(curr_cid)
 
         try:
-            # 3. 完美的物理对象切分
+            conversation = await conv_mgr.get_conversation(uid, curr_cid)
+            if not conversation or not conversation.history:
+                return False
+
+            try:
+                raw_history = json.loads(conversation.history)
+            except Exception as e:
+                logger.error(f"[无感压缩上下文] 解析会话历史记录 JSON 失败: {e}")
+                return False
+
+            # 1. 照搬官方：利用强类型装配算子将生历史一键转换为 Message 对象数组
+            all_messages = bind_checkpoint_messages(raw_history)
+            dialogue_messages = [m for m in all_messages if m.role != "system"]
+
+            # 提取当前特征
+            runtime_provider, _ = self._resolve_runtime_context(event, conversation)
+
+            # 格式化解耦判定：只要触发了内部抽象占位符，或者取出的模型格式不合法（缺少提供商前缀 /），一律强行向下刷新
+            if (
+                runtime_provider == self.default_provider_placeholder
+                or "/" not in runtime_provider
+            ):
+                runtime_provider = await self.context.get_current_chat_provider_id(umo=uid)
+
+            runtime_provider = str(runtime_provider).strip()
+            runtime_platform_id = event.get_platform_id()
+            runtime_group_id = (
+                str(event.message_obj.group_id).strip()
+                if (event.message_obj and event.message_obj.group_id)
+                else ""
+            )
+            runtime_chat_type = "group" if runtime_group_id else "private"
+
+            # 载入配置
+            try:
+                max_turns = int(self.config.get("max_conversation_length", 40))
+                max_tokens = int(self.config.get("max_context_tokens", 16000))
+                keep_recent = int(self.config.get("keep_recent", 2))
+            except (ValueError, TypeError):
+                max_turns, max_tokens, keep_recent = 40, 16000, 2
+
+            # 路由网格规则碰撞
+            special_rules = self.config.get("special_rules", [])
+            best_rule, best_specificity_score = None, -1
+            for rule in special_rules:
+                if (
+                    rule.get("target_provider", "").strip()
+                    and rule.get("target_provider", "").strip() != runtime_provider
+                ):
+                    continue
+                if (
+                    rule.get("target_platform_id", "").strip()
+                    and rule.get("target_platform_id", "").strip() != runtime_platform_id
+                ):
+                    continue
+                if (
+                    rule.get("chat_type", "").strip()
+                    and rule.get("chat_type", "").strip() != runtime_chat_type
+                ):
+                    continue
+                current_score = sum(
+                    [
+                        bool(rule.get("target_provider")),
+                        bool(rule.get("target_platform_id")),
+                        bool(rule.get("chat_type")),
+                    ]
+                )
+                if current_score > best_specificity_score:
+                    best_specificity_score = current_score
+                    best_rule = rule
+
+            if best_rule and best_specificity_score > 0:
+                try:
+                    max_turns = int(best_rule.get("max_turns", max_turns))
+                    max_tokens = int(best_rule.get("max_tokens", max_tokens))
+                    keep_recent = int(best_rule.get("keep_recent", keep_recent))
+                except (ValueError, TypeError):
+                    pass
+
+            # 极端边界防御：清洗 keep_recent 配置，保证其至少为 1
+            keep_recent = max(1, keep_recent)
+
+            # 2. 精准审计轮数：直接通过强类型 Message 对象计算 User 出现的绝对次数
+            user_indices = [i for i, m in enumerate(dialogue_messages) if m.role == "user"]
+            current_turns = len(user_indices)
+
+            # 极端边界防御：如果我们保留的最近轮数 >= 总用户轮数，说明没有老对话可压缩，直接就地返回 False
+            if len(user_indices) <= keep_recent:
+                return False
+
+            if len(dialogue_messages) <= keep_recent * 2 or current_turns < max_turns:
+                return False
+
+            # 阈值判定
+            should_compress = force_trigger
+            if not should_compress:
+                if current_turns >= max_turns:
+                    should_compress = True
+                elif (
+                    max_tokens > 0
+                    and self.token_counter.count_tokens(dialogue_messages) >= max_tokens
+                ):
+                    should_compress = True
+
+            if not should_compress:
+                return False
+
+            # 3. 完美的物理对象切分 (因上面做了 user_indices 长度强校验，此处的 slice 边界绝对安全，不会 IndexError)
             split_user_msg = dialogue_messages[user_indices[-keep_recent]]
             split_index_in_all = all_messages.index(split_user_msg)
 
