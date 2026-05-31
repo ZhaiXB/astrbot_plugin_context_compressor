@@ -20,7 +20,7 @@
     "summary_instruction": {
         "description": "个性化总结提示词指令",
         "type": "text",
-        "default": "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\nThe primary goal of this summary is to enable seamless continuation of the work that follows.\n1. Systematically cover all core topics discussed and the final conclusion/outcome for each; clearly highlight the latest primary focus.\n2. If any tools were used, summarize tool usage (total call count) and extract the most valuable insights from tool outputs.\n3. If any materials (files, documents, code, references) were read during the conversation that may be helpful for subsequent work, list each one with its scope and path.\n4. If there was an initial user goal, state it first and describe the current progress/status.\n5. Write the summary in the user's language.\n",
+        "default": "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress.\n1. Systematically cover all core topics discussed and the final conclusion/outcome for each; clearly highlight the latest primary focus.\n2. If any tools were used, summarize tool usage (total call count) and extract the most valuable insights from tool outputs.\n3. If there was an initial user goal, state it first and describe the current progress/status.\n4. Write the summary in the user's language.\n",
         "hint": "分发给大模型的总结大纲要求。留空则自动使用内置的系统默认英文指令。"
     },
     "special_rules": {
@@ -29,13 +29,13 @@
         "hint": "允许你针对特定大模型、机器人实例或群聊/私聊独立定制水线。单项留空代表不作限制（通配）。填写的约束项越多，匹配优先级越高。",
         "templates": {
             "combined_rule": {
-                "name": "添加专属触发规则",
+                "name": "配置专属规则",
                 "items": {
                     "rule_name": {
-                        "description": "📌 规则别名 / 备注",
+                        "description": "📌 规则备注 / 别名",
                         "type": "string",
                         "default": "新规则",
-                        "hint": "为这条专属规则起个名字，方便多条规则时一眼区分。例如：QQ代码群专属 / Web端测试"
+                        "hint": "为这条规则起个名字，方便多条规则时一眼区分。例如：QQ代码群专属 / 网页端测试"
                     },
                     "target_provider": { 
                         "description": "1. 匹配的当前会话大模型", 
@@ -65,7 +65,7 @@
                         "_special": "select_provider"
                     },
                     "max_turns": { "description": "专属对话轮数阈值", "type": "int", "default": 40, "hint": "此特定环境下触发自动压缩的轮数。默认值：40" },
-                    "max_tokens": { "description": "专属 Token 阈值", "type": "int", "default": 16000, "hint": "此特定环境下触发自动压缩的 Token数。默认值：16000" },
+                    "max_tokens": { "description": "专属 Token 阈值", "type": "int", "default": 16000, "hint": "此特定环境下触发自动压缩的 Token 数。默认值：16000" },
                     "keep_recent": { "description": "专属保留对话轮数", "type": "int", "default": 2, "hint": "此特定环境下压缩后保留的最新原文轮数。默认值：2" }
                 }
             }
